@@ -21,19 +21,20 @@ the sanitized `Dgx_Spark_Best_Settings` baseline.
 
 ## P1 — real checkpoint semantic inventory and binder
 
-1. Run `checkpoint_manifest.py` against the exact target and DFlash2
-   checkpoints mounted on DGX Spark.
-2. Capture all tensor names/shapes/encoded metadata without loading full weights.
-3. Add `Glm53ParameterId`/logical-name schema independent of Hugging Face names.
-4. Implement a strict source-name mapper for all 45 target layers and draft
-   components.
-5. Add shape/format/coverage checks: every required logical parameter exactly
-   once, no silent extras used as substitutes.
-6. Produce a deterministic mapping receipt containing checkpoint revisions and
-   tensor-index hashes.
+**Implemented**
 
-**Exit criterion:** target + draft checkpoints bind completely on CPU metadata;
-no CUDA execution is needed to prove mapping completeness.
+- logical catalog for the 45 decoder layers, the source-index-45 next-token
+  module, the vision tower, and the five-layer DFlash2 draft;
+- strict source-name mapping with dtype, storage shape, and coverage checks;
+- safetensors header reader plus the 4-byte MCG multiplier check;
+- `ninfer-glm53-bind` and committed receipts.
+
+**Exit criterion met** on the pinned checkpoints, CPU metadata only. The target
+at `25a44fdbf16862a46b7cc9921142c6c81350af2f` binds 150226/150226 tensors,
+including every `.mcg` payload `0xCBAC1FED`. DFlash2 at
+`dc77ff1c99eeb2df044ee3d4f0094eb033fee410` binds 81/81. See
+[`checkpoint-binding.md`](checkpoint-binding.md). The checkpoint still reports
+`serving_reader_qualified: false`; that is a P2/P3 gate, not a binding failure.
 
 ## P2 — EXL3/TR3 encoded storage and materialization
 

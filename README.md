@@ -12,7 +12,13 @@ changes required by GLM-5.3-Flash and two-node TP2.
 
 ## Status
 
-The repository is in **P0: executable contracts**.
+P0 contracts and **P1 checkpoint binding** are in place. The pinned EXL3
+target (150226 tensors) and DFlash2 draft (81 tensors) bind completely on CPU
+metadata, including EXL3 storage shapes and the MCG multiplier. See
+[`docs/checkpoint-binding.md`](docs/checkpoint-binding.md).
+
+The repository is otherwise still pre-kernel. P2 is the EXL3/TR3 encoded
+representation and rank-local memory plan.
 
 Implemented now:
 
@@ -29,11 +35,13 @@ Implemented now:
 - DFlash2 target/draft geometry in the plan;
 - read-only DGX Spark node preflight;
 - local checkpoint config/shard manifest scanner;
+- logical parameter catalog for the target, next-token module, vision tower, and DFlash2 draft;
+- strict checkpoint binder with safetensors header and MCG-multiplier checks;
 - host build and CTest coverage plus GitHub Actions host CI.
 
 Not implemented yet—and deliberately **not faked with placeholder kernels**:
 
-- real EXL3/TR3 tensor semantic mapping and materialization;
+- decoded EXL3/TR3 materialization (storage shapes are bound; the trellis is not decoded);
 - CUDA/SM121 kernels for GLM KDA, sparse MLA/indexer and MoE;
 - NCCL/RoCE TP2 process runtime;
 - target/draft GPU execution and DFlash2 verification;
@@ -80,6 +88,15 @@ ctest --test-dir build --output-on-failure
 The plan command validates both contracts and prints all 45 layers with their
 mixer, persistent-state class, FFN class and TP synchronization boundaries.
 This is the host oracle that future GPU code must continue to satisfy.
+
+Bind a real checkpoint after the build. The command reads config and
+safetensors headers, checks every tensor against the logical catalog, and
+writes a receipt:
+
+```bash
+./build/ninfer-glm53-bind /path/to/GLM-5.3-Flash-EXL3 -o receipt.json
+./build/ninfer-glm53-bind /path/to/GLM-5.3-Flash-DFlash2 -o dflash-receipt.json
+```
 
 ## DGX Spark preflight
 

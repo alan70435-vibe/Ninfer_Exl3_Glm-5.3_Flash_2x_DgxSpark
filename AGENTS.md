@@ -39,10 +39,11 @@ execution mode, input shape, sample protocol and whether caches are warm/cold.
 
 ## Checkpoint rules
 
-Do not infer EXL3/TR3 tensor semantics from filenames. Inventory the real local
-checkpoint, pin its revision/index hashes, then encode explicit logical bindings.
-A binder must fail if any required logical parameter is missing, duplicated or
-shape/format incompatible.
+`parameter_schema` is the logical catalog. `checkpoint_binding` is the coverage
+check. Do not infer EXL3/TR3 tensor semantics from filenames. A binder must fail
+if any required logical parameter is missing, duplicated or shape/format
+incompatible. Storage shapes are not a decoded trellis; do not treat a complete
+binding receipt as a serving kernel.
 
 ## Deployment baseline
 

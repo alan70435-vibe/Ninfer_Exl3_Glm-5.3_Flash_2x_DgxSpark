@@ -1,0 +1,29 @@
+{
+  "schema": "ninfer-glm53.binding-receipt.v1",
+  "kind": "glm53_flash_exl3_target",
+  "complete": true,
+  "shapes_checked": true,
+  "mcg_payload_checked": true,
+  "expected_tensors": 150226,
+  "observed_tensors": 150226,
+  "bound": 150226,
+  "missing": 0,
+  "unexpected": 0,
+  "dtype_mismatches": 0,
+  "shape_mismatches": 0,
+  "mcg_mismatches": 0,
+  "schema_errors": 0,
+  "io_errors": 0,
+  "weight_bytes": 175642157752,
+  "config_sha256": "4f5341e048984459471bfb9c894e6bf87e69b9c67402672af901631d1349f265",
+  "index_sha256": "2f64d21c67c90bbafeb36c4e9b2f06f54063ed439e9f7cf95962d425a1d8515d",
+  "logical_catalog_sha256": "f3a76ffad53259bbde06e7bbf43a138d0e5af60344cb5a1d8305058572328a90",
+  "observed_names_sha256": "60b13aad6b8ddaf53775ccb1d3ec975a1dcc5180fbf04f94efbc94d170cefa68",
+  "mirror_upstream_revision": "5ab363a8dcf6405955fd5f99671e01a1c9fb124b",
+  "source_model_revision": "a6c167b62691b2bac901344b65cb651a70f53e43",
+  "snapshot_revision": "25a44fdbf16862a46b7cc9921142c6c81350af2f",
+  "warnings": [
+    "checkpoint marks serving_reader_qualified=false; binding checks storage, not a qualified runtime reader"
+  ],
+  "errors": []
+}
