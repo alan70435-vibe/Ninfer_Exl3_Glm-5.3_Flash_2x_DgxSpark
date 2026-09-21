@@ -20,6 +20,8 @@ metadata, including EXL3 storage shapes and the MCG multiplier. See
 The repository is otherwise still pre-kernel. P2 is the EXL3/TR3 encoded
 representation and rank-local memory plan.
 
+NVFP4 runtime work continues in [Ninfer_Nvfp4_Glm-5.3_Flash_2x_DgxSpark](https://github.com/alan70435/Ninfer_Nvfp4_Glm-5.3_Flash_2x_DgxSpark). This repository keeps the EXL3 binding line.
+
 Implemented now:
 
 - a compile-time GLM-5.3-Flash mathematical contract (45 layers);
