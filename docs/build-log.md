@@ -93,6 +93,12 @@ until this gap is closed or explicitly bounded.
   preservation of caller arguments on TP3/TP4. The KDA BF16 large-M prefill
   was already in `775a58b`. None of these commits replace the eager math.
 
+## Launch refused, measured 2026-09-22T14:25:17+08:00
+
+Head `gx10-5749` had an active wayland session. MemAvailable was 120881568 KiB. `glm53-exl3-head` was Exited (255). Worker `gx10-23ec` answered ping and was already running `glm53-exl3-worker` (`VLLM::Worker_TP` pid 3737500, 106226 MiB); worker MemAvailable was 6.1 GiB. `ninfer-glm53-generate` was not started for greedy, TP=2, or DFlash2. No new token ids.
+
+The existing host build's CTest was 11/11. That suite is not a GB10 continuation.
+
 ## Still required on Blackwell
 
 SM121 kernels for KDA, sparse MLA, the indexer, and MoE; an NCCL TP2 process
