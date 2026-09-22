@@ -99,6 +99,10 @@ Head `gx10-5749` had an active wayland session. MemAvailable was 120881568 KiB. 
 
 The existing host build's CTest was 11/11. That suite is not a GB10 continuation.
 
+## Short greedy on the worker, measured 2026-09-22T14:33:40+08:00
+
+After `glm53-exl3-worker` was stopped, `ninfer-glm53-generate` ran on `gx10-23ec` (NVIDIA GB10 12.1, `GPU-d5d58447-ec10-0155-e20a-cf12158797b9`), not on the head desktop. Prompt `13041`, greedy, `new_tokens=2`, revision `25a44fdbf16862a46b7cc9921142c6c81350af2f`. Both repeats returned `token_ids=154822,154822`, `committed_length=2`, `world_size=1`. The first-token logits were `154822=20.9312` and `315=6.65862`. The recorded external continuation remains `13041,13041`. These two repeats agree with each other and do not match that continuation.
+
 ## Still required on Blackwell
 
 SM121 kernels for KDA, sparse MLA, the indexer, and MoE; an NCCL TP2 process
