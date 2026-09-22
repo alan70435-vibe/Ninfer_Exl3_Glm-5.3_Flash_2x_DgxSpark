@@ -109,6 +109,8 @@ The same worker, still not the head desktop, ran a one-token replay inside `glm5
 
 A later pass on the same worker, still inside a 24 GiB container and without loading the vLLM engine, compared the server's 1-token kernels with that replay. Chunk KDA and fused recurrent KDA agreed at cosine `0.999998` (max abs `0.000122`). The 1-token fused mHC kernel and separate post-then-pre agreed at cosine `0.99999988` (max abs `0.000488`). Rounding each MLA latent through fp8 e4m3 before the value projection left the layer-44 argmax at `154822` with logit `21.125` and runner-up `315` at `6.65625`. The production server that recorded `13041,13041` had `SPEC_METHOD=dflash` and `TP=2`. Reloading that engine on one Spark allocated until about 1.5 GiB remained and CUDA reported out of memory; the container was stopped and worker MemAvailable returned to about 115 GiB.
 
+A single `Glm5NextLinearAttention` for layer 0, built from that vLLM image with tensor parallel initialized and no engine load, accepted the checkpoint tensors through its own weight loaders. Every loaded KDA matrix matched the raw safetensors value with max abs `0`, including `in_proj_qkvbfg_a`, the three conv weights, and `o_proj`. Worker MemAvailable stayed near 119 GiB.
+
 ## Still required on Blackwell
 
 SM121 kernels for KDA, sparse MLA, the indexer, and MoE; an NCCL TP2 process
