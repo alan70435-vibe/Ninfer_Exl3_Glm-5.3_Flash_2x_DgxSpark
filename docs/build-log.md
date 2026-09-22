@@ -111,6 +111,8 @@ A later pass on the same worker, still inside a 24 GiB container and without loa
 
 A single `Glm5NextLinearAttention` for layer 0, built from that vLLM image with tensor parallel initialized and no engine load, accepted the checkpoint tensors through its own weight loaders. Every loaded KDA matrix matched the raw safetensors value with max abs `0`, including `in_proj_qkvbfg_a`, the three conv weights, and `o_proj`. Worker MemAvailable stayed near 119 GiB.
 
+On 2026-09-22 the same 24 GiB replay printed per-operator norms. Layer 3's MoE norm was `261.96`, the same value previously checked against `exl3_linear_reference`. Layer 9's stream norm was `12.626`. Layer 10's FFN norm was `205.65` (routed `90.435`, shared `122.01`) and its mHC post mean abs was `0.14076`, so the added branch is about `29` and the stream norm became `33.519`. Layer 6 had a larger shared expert (`167.42`) but a post mean abs of only `0.0406`, and its stream norm stayed `13.216`. The jump is that post coefficient times the FFN, not a second application of `routed_scaling_factor`. The partial argmax became `19845` at layer 10 and `154822` at layer 29.
+
 ## Still required on Blackwell
 
 SM121 kernels for KDA, sparse MLA, the indexer, and MoE; an NCCL TP2 process
