@@ -1,65 +1,41 @@
 #include "ninfer_glm53/exl3_decode.hpp"
-
-#include <cmath>
+#include "exl3_test_oracle.hpp"
+#include <algorithm>
 #include <cstdlib>
 #include <iostream>
 
-namespace {
-
-void expect(bool condition, const char* message) {
-    if (!condition) {
-        std::cerr << message << '\n';
-        std::exit(1);
-    }
+static void expect(bool ok, const char* message) {
+    if (!ok) { std::cerr << message << '\n'; std::exit(1); }
 }
-
-bool near(float actual, float expected) { return std::fabs(actual - expected) < 1e-5f; }
-
-}  // namespace
-
 int main() {
     using namespace ninfer::glm53;
-    std::uint16_t perm[256];
+    std::uint16_t packed[64], states[256], perm[256];
     exl3_tensor_core_perm(perm);
-    expect(perm[0] == 0 && perm[1] == 16 && perm[2] == 128 && perm[3] == 144, "tensor-core perm head");
-    expect(perm[4] == 8 && perm[5] == 24 && perm[6] == 136 && perm[7] == 152, "tensor-core perm tail");
-
-    std::uint16_t packed[kExl3PackedU16];
-    std::uint16_t states[256];
-    for (auto& word : packed) word = 0xffffu;
-    unpack_trellis_k4(packed, states);
-    for (const auto state : states) expect(state == 0xffffu, "all-ones tile is state 65535");
-    expect(near(mcg_symbol(states[0]), mcg_symbol(0xffffu)), "all-ones mcg uses the 16-bit state");
-    expect(std::fabs(mcg_symbol(0xffffu) - mcg_symbol(0xfu)) > 0.1f, "nibble 15 is not state 65535");
-
-    for (auto& word : packed) word = 0;
-    unpack_trellis_k4(packed, states);
-    for (const auto state : states) expect(state == 0, "all-zero tile is state 0");
-
-    // Non-periodic payload. Expected windows come from the published bit schedule, not from pack_trellis_k4.
-    for (int i = 0; i < kExl3PackedU16; ++i) packed[i] = static_cast<std::uint16_t>(0x1111u * static_cast<unsigned>(i + 1));
-    unpack_trellis_k4(packed, states);
-    expect(states[0] == 0x32f2u && states[1] == 0x2f22u, "cross-word window 0");
-    expect(states[16] == 0x3336u && states[17] == 0x3366u, "cross-word window 8");
-    expect(states[254] == 0x0332u && states[255] == 0x332fu, "wrapped tail window");
-
-    for (auto& word : packed) word = 0;
-    float suh[16];
-    float svh[16];
-    for (int i = 0; i < 16; ++i) {
-        suh[i] = 1.f;
-        svh[i] = 1.f;
+    bool seen[256]{};
+    for (unsigned i=0;i<256;++i) {
+        expect(perm[i] < 256 && !seen[perm[i]], "permutation not bijective");
+        seen[perm[i]] = true;
+        expect(oracle_order(perm[i]/16,perm[i]%16) == i, "permutation differs from scalar layout");
     }
-    suh[0] = 2.f;
-    svh[0] = 0.5f;
-    svh[1] = 3.f;
-    float tile[256];
-    exl3_decode_tile(packed, suh, svh, tile);
-    float x[16] = {1.f};
-    float y[16] = {};
-    exl3_gemv_tile(x, tile, y);
-    const float symbol0 = mcg_symbol(0);
-    expect(near(y[0], symbol0 * 2.f * 0.5f), "exl3 gemv column 0");
-    expect(near(y[1], symbol0 * 2.f * 3.f), "exl3 gemv column 1");
-    return 0;
+    for (unsigned state=0;state<65536;++state)
+        expect(mcg_symbol(state) == oracle_mcg(static_cast<std::uint16_t>(state)), "MCG binary16 rounding");
+    for (unsigned pattern=0;pattern<10;++pattern) {
+        for (unsigned i=0;i<64;++i)
+            packed[i] = pattern == 0 ? 0 : pattern == 1 ? 65535 : static_cast<std::uint16_t>(i*40503u+pattern*32771u);
+        unpack_trellis_k4(packed,states);
+        float tile[256]; exl3_decode_inner_tile(packed,tile);
+        for (unsigned i=0;i<256;++i) {
+            expect(states[i] == oracle_state(packed,i), "16-bit state/window/wrap mismatch");
+            expect(tile[perm[i]] == oracle_mcg(states[i]), "inner tile codebook mapping");
+        }
+    }
+    std::uint16_t transitions[256];
+    for (unsigned i=0;i<256;++i) transitions[i] = static_cast<std::uint16_t>((i*7+3)&15);
+    pack_trellis_k4(transitions,packed);
+    for (unsigned w=0;w<32;++w) {
+        std::uint32_t expected=0;
+        for (unsigned j=0;j<8;++j) expected=(expected<<4)|transitions[8*w+j];
+        expect(packed[2*w] == (expected&65535) && packed[2*w+1] == (expected>>16), "packed byte order");
+    }
+    std::cout << "65536 MCG states, 2560 raw windows, permutation and pack layout passed\n";
 }

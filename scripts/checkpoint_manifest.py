@@ -6,11 +6,16 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
-import struct
+import os
 from collections import Counter
 from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Any
+
+try:
+    from . import checkpoint_io as cio
+except ImportError:
+    import checkpoint_io as cio
 
 EXPECTED = {
     "architectures.0": "Glm5NextForConditionalGeneration",
@@ -61,14 +66,14 @@ INDEX_CANDIDATES = (
     "pytorch_model.bin.index.json",
 )
 
-MAX_SAFETENSORS_HEADER_BYTES = 256 * 1024 * 1024
-
-
 def dig(data: Any, dotted: str) -> Any:
     cur = data
     for part in dotted.split("."):
         if isinstance(cur, list):
-            cur = cur[int(part)]
+            try:
+                cur = cur[int(part)]
+            except (ValueError, IndexError):
+                return None
         elif isinstance(cur, dict) and part in cur:
             cur = cur[part]
         else:
@@ -76,30 +81,10 @@ def dig(data: Any, dotted: str) -> Any:
     return cur
 
 
-def sha256(path: Path, chunk: int = 8 * 1024 * 1024) -> str:
-    h = hashlib.sha256()
-    with path.open("rb") as f:
-        while block := f.read(chunk):
-            h.update(block)
-    return h.hexdigest()
-
-
 def read_safetensors_header(path: Path) -> dict[str, Any]:
-    """Read only the JSON header of a safetensors file."""
-    with path.open("rb") as f:
-        raw_len = f.read(8)
-        if len(raw_len) != 8:
-            raise ValueError("file is shorter than safetensors framing")
-        (header_len,) = struct.unpack("<Q", raw_len)
-        if header_len == 0 or header_len > MAX_SAFETENSORS_HEADER_BYTES:
-            raise ValueError(f"invalid safetensors header length {header_len}")
-        raw_header = f.read(header_len)
-        if len(raw_header) != header_len:
-            raise ValueError("truncated safetensors JSON header")
-    header = json.loads(raw_header)
-    if not isinstance(header, dict):
-        raise ValueError("safetensors header must be a JSON object")
-    return header
+    """Standalone header reader; caller explicitly supplies this file's root."""
+    with cio.open_checkpoint_file(path.parent, path.name) as stream:
+        return cio.read_header(stream)
 
 
 @dataclass(frozen=True)
@@ -116,14 +101,16 @@ def main() -> int:
     parser.add_argument("checkpoint", type=Path, help="local checkpoint directory")
     parser.add_argument("--hash-shards", action="store_true", help="SHA-256 all weight shards (can be slow)")
     parser.add_argument("--output", type=Path, help="write JSON report here")
+    parser.add_argument("--trusted-root", type=Path, action="append", default=[],
+                        help="additional approved cache root for checkpoint symlinks (repeatable)")
     args = parser.parse_args()
 
-    root = args.checkpoint.expanduser().resolve()
-    config_path = root / "config.json"
-    if not config_path.is_file():
-        parser.error(f"missing {config_path}")
-
-    config = json.loads(config_path.read_text(encoding="utf-8"))
+    try:
+        root = args.checkpoint.expanduser().resolve(strict=True)
+        trusted_roots = tuple(p.expanduser().resolve(strict=True) for p in args.trusted_root)
+        config, config_hash = cio.read_json_file(root, "config.json", trusted_roots, cio.CONFIG_LIMIT)
+    except (OSError, ValueError, RuntimeError) as exc:
+        parser.error(str(exc))
     errors: list[str] = []
     warnings: list[str] = []
     observed: dict[str, Any] = {}
@@ -145,24 +132,26 @@ def main() -> int:
     if actual_mlp_types != expected_mlp_types:
         errors.append("text_config.mlp_layer_types does not match the 3 dense / 42 sparse-MoE topology")
 
-    index_path = next((root / name for name in INDEX_CANDIDATES if (root / name).is_file()), None)
+    index_path = next((root / name for name in INDEX_CANDIDATES
+                       if (root / name).exists() or (root / name).is_symlink()), None)
+    index_hash = None
     weight_map: dict[str, str] = {}
     if index_path:
-        index = json.loads(index_path.read_text(encoding="utf-8"))
-        raw_map = index.get("weight_map", {})
-        if not isinstance(raw_map, dict):
-            errors.append(f"{index_path.name}: weight_map is not an object")
-        else:
-            weight_map = {str(k): str(v) for k, v in raw_map.items()}
-
+        try:
+            index, index_hash = cio.read_json_file(root, index_path.name, trusted_roots, cio.INDEX_LIMIT)
+            raw_map = index.get("weight_map")
+            if not isinstance(raw_map, dict) or not raw_map:
+                raise ValueError("weight_map must be a nonempty object")
+            if not all(isinstance(k, str) and k and isinstance(v, str) and v for k, v in raw_map.items()):
+                raise ValueError("weight_map must contain nonempty string names and paths")
+            weight_map = raw_map
+        except (OSError, ValueError, RuntimeError) as exc:
+            errors.append(f"{index_path.name}: {exc}")
     referenced_shards = sorted(set(weight_map.values()))
-    if not referenced_shards:
+    if index_path is None:
         referenced_shards = sorted(p.name for p in root.glob("*.safetensors"))
-        if not referenced_shards:
-            referenced_shards = sorted(p.name for p in root.glob("*.bin"))
-
     if not referenced_shards:
-        errors.append("no weight shards or weight index found")
+        errors.append("no supported safetensors weight shards found")
 
     files: list[FileRecord] = []
     missing_shards: list[str] = []
@@ -172,16 +161,16 @@ def main() -> int:
     shard_header_errors: list[str] = []
 
     for name in referenced_shards:
-        path = root / name
-        if not path.is_file():
-            missing_shards.append(name)
-            continue
-
         header_tensor_count: int | None = None
         header_error: str | None = None
-        if path.suffix == ".safetensors":
-            try:
-                header = read_safetensors_header(path)
+        file_size = 0
+        shard_hash = None
+        try:
+            if not name.endswith(".safetensors"):
+                raise ValueError("unsupported shard format: header coverage is unverified")
+            with cio.open_checkpoint_file(root, name, trusted_roots) as stream:
+                file_size = os.fstat(stream.fileno()).st_size
+                header = cio.read_header(stream)
                 tensors = {k: v for k, v in header.items() if k != "__metadata__"}
                 header_tensor_count = len(tensors)
                 for tensor_name, metadata in tensors.items():
@@ -189,26 +178,16 @@ def main() -> int:
                         duplicate_header_tensors.append(tensor_name)
                         continue
                     tensor_owner_from_headers[tensor_name] = name
-                    if isinstance(metadata, dict):
-                        actual_tensor_records[tensor_name] = {
-                            "dtype": metadata.get("dtype"),
-                            "shape": metadata.get("shape"),
-                        }
-                    else:
-                        actual_tensor_records[tensor_name] = {"invalid_metadata": True}
-            except (OSError, ValueError, json.JSONDecodeError) as exc:
-                header_error = str(exc)
-                shard_header_errors.append(f"{name}: {exc}")
-
-        files.append(
-            FileRecord(
-                name=name,
-                size=path.stat().st_size,
-                sha256=sha256(path) if args.hash_shards else None,
-                tensor_count=header_tensor_count,
-                header_error=header_error,
-            )
-        )
+                    actual_tensor_records[tensor_name] = {"dtype": metadata["dtype"], "shape": metadata["shape"]}
+                # Hash the SAME opened file that supplied the header, never reopen a path.
+                shard_hash = cio.hash_open_file(stream) if args.hash_shards else None
+        except FileNotFoundError:
+            missing_shards.append(name)
+            continue
+        except (OSError, ValueError, RuntimeError) as exc:
+            header_error = str(exc)
+            shard_header_errors.append(f"{name}: {exc}")
+        files.append(FileRecord(name, file_size, shard_hash, header_tensor_count, header_error))
 
     if missing_shards:
         errors.append(f"missing {len(missing_shards)} referenced weight shard(s)")
@@ -220,7 +199,7 @@ def main() -> int:
     index_missing_from_headers: list[str] = []
     index_owner_mismatches: list[dict[str, str]] = []
     header_unindexed: list[str] = []
-    if weight_map and actual_tensor_records and not shard_header_errors:
+    if weight_map:
         for tensor_name, expected_owner in weight_map.items():
             actual_owner = tensor_owner_from_headers.get(tensor_name)
             if actual_owner is None:
@@ -237,7 +216,9 @@ def main() -> int:
         if header_unindexed:
             warnings.append(f"{len(header_unindexed)} header tensor(s) are not present in the weight_map")
 
-    tensor_names = sorted(actual_tensor_records or {name: {} for name in weight_map})
+    if not actual_tensor_records:
+        errors.append("no tensors observed in supported shard headers")
+    tensor_names = sorted(actual_tensor_records)
     prefixes: dict[str, int] = {}
     for name in tensor_names:
         prefix = name.split(".", 1)[0]
@@ -270,17 +251,26 @@ def main() -> int:
     tensor_schema_sha256 = hashlib.sha256(schema_bytes).hexdigest() if schema_rows else None
 
     report = {
-        "schema": 2,
+        "schema": 3,
         "checkpoint": str(root),
         "valid_checkpoint_contract": not errors,
         "errors": errors,
         "warnings": warnings,
-        "config_sha256": sha256(config_path),
+        "config_sha256": config_hash,
         "index_file": index_path.name if index_path else None,
-        "index_sha256": sha256(index_path) if index_path else None,
+        "index_sha256": index_hash,
         "expected_fields": EXPECTED,
         "observed_fields": observed,
         "tensor_count": len(tensor_names),
+        "index_declared_tensor_count": len(weight_map),
+        "header_observed_tensor_count": len(actual_tensor_records),
+        "header_coverage_checked": bool(actual_tensor_records) and not shard_header_errors and not missing_shards,
+        "storage_ranges_checked": bool(actual_tensor_records) and not shard_header_errors and not missing_shards,
+        "payload_integrity_verified": False,
+        "model_catalog_checked": False,
+        "gpu_qualified": False,
+        "deployable": False,
+        "trusted_roots": [str(root), *(str(p) for p in trusted_roots)],
         "tensor_schema_sha256": tensor_schema_sha256,
         "tensor_dtype_counts": dict(sorted(dtype_counts.items())),
         "tensor_namespace_profile": namespace_profile,

@@ -1,6 +1,9 @@
 #include "ninfer_glm53/exl3_decode.hpp"
 
 #include <cstring>
+#include <algorithm>
+#include <cmath>
+#include <stdexcept>
 
 namespace ninfer::glm53 {
 namespace {
@@ -122,8 +125,8 @@ void pack_trellis_k4(const std::uint16_t symbols[256], std::uint16_t packed[kExl
 }
 
 void unpack_trellis_k4(const std::uint16_t packed[kExl3PackedU16], std::uint16_t symbols[256]) {
-    // ExLlamaV3 unpack_trellis_kernel<4>. Each step stores K bits; the value
-    // fed to the MCG codebook is the overlapping 16-bit window, not that nibble.
+    // ExLlamaV3 unpack_trellis_kernel<4>. The MCG sees the overlapping 16-bit
+    // window, not the 4-bit transition stored in that window.
     constexpr int k_bits = 4;
     std::uint32_t words[32];
     for (int index = 0; index < 32; ++index) {
@@ -145,18 +148,18 @@ void unpack_trellis_k4(const std::uint16_t packed[kExl3PackedU16], std::uint16_t
     }
 }
 
-void exl3_decode_tile(const std::uint16_t packed[kExl3PackedU16], const float suh[kExl3Tile],
-                      const float svh[kExl3Tile], float tile_kn[kExl3Tile * kExl3Tile]) {
-    std::uint16_t symbols[256];
-    std::uint16_t perm[256];
-    unpack_trellis_k4(packed, symbols);
+void exl3_decode_inner_tile(const std::uint16_t packed[kExl3PackedU16], float tile_kn[256]) {
+    std::uint16_t states[256], perm[256];
+    unpack_trellis_k4(packed, states);
     exl3_tensor_core_perm(perm);
-    for (int kernel_pos = 0; kernel_pos < 256; ++kernel_pos) {
-        const int row_major = perm[kernel_pos];
-        const int k = row_major / kExl3Tile;
-        const int n = row_major % kExl3Tile;
-        tile_kn[k * kExl3Tile + n] = mcg_symbol(symbols[kernel_pos]) * suh[k] * svh[n];
-    }
+    for (int pos = 0; pos < 256; ++pos) tile_kn[perm[pos]] = mcg_symbol(states[pos]);
+}
+
+void exl3_decode_tile(const std::uint16_t packed[kExl3PackedU16], const float suh[kExl3Tile],
+                      const float svh[kExl3Tile], float tile_kn[256]) {
+    exl3_decode_inner_tile(packed, tile_kn);
+    for (int k = 0; k < kExl3Tile; ++k)
+        for (int n = 0; n < kExl3Tile; ++n) tile_kn[k * kExl3Tile + n] *= suh[k] * svh[n];
 }
 
 void exl3_gemv_tile(const float x[kExl3Tile], const float tile_kn[kExl3Tile * kExl3Tile],
@@ -166,6 +169,64 @@ void exl3_gemv_tile(const float x[kExl3Tile], const float tile_kn[kExl3Tile * kE
         for (int k = 0; k < kExl3Tile; ++k) sum += x[k] * tile_kn[k * kExl3Tile + n];
         y[n] = sum;
     }
+}
+
+namespace {
+void hadamard128(std::span<double> values) {
+    constexpr std::size_t block = kExl3HadamardBlock;
+    const double normalization = 1.0 / std::sqrt(static_cast<double>(block));
+    for (std::size_t base = 0; base < values.size(); base += block) {
+        for (std::size_t stride = 1; stride < block; stride *= 2)
+            for (std::size_t j = 0; j < block; j += 2 * stride)
+                for (std::size_t i = 0; i < stride; ++i) {
+                    const auto a = values[base + j + i], b = values[base + j + i + stride];
+                    values[base + j + i] = a + b;
+                    values[base + j + i + stride] = a - b;
+                }
+        for (std::size_t i = 0; i < block; ++i) values[base + i] *= normalization;
+    }
+}
+void finite_half(std::span<const std::uint16_t> values) {
+    for (const auto value : values)
+        if ((value & 0x7c00u) == 0x7c00u) throw std::invalid_argument("nonfinite EXL3 F16 scale/bias");
+}
+}  // namespace
+
+std::vector<double> exl3_linear_reference(const Exl3LinearView& m, std::span<const float> input,
+                                         std::size_t rows, std::size_t max_elements) {
+    const auto k = m.in_features, n = m.out_features;
+    if (!k || !n || k % 128 || n % 128 || k > max_elements / n)
+        throw std::invalid_argument("EXL3 dimensions must be 128-aligned and within the element budget");
+    if (!rows || rows > 32 || input.size() / rows != k || input.size() % rows)
+        throw std::invalid_argument("EXL3 input requires 1..32 exact rows");
+    if (m.trellis.size() != k * n / 4 || m.suh.size() != k || m.svh.size() != n ||
+        (!m.bias.empty() && m.bias.size() != n))
+        throw std::invalid_argument("EXL3 storage extent mismatch");
+    finite_half(m.suh); finite_half(m.svh); finite_half(m.bias);
+    for (float value : input)
+        if (!std::isfinite(value)) throw std::invalid_argument("nonfinite EXL3 input");
+    std::vector<double> result(rows * n, 0.0), transformed(k);
+    for (std::size_t row = 0; row < rows; ++row) {
+        for (std::size_t i = 0; i < k; ++i)
+            transformed[i] = static_cast<double>(input[row * k + i]) * fp16_to_f32(m.suh[i]);
+        hadamard128(transformed);
+        auto output = std::span(result).subspan(row * n, n);
+        for (std::size_t kb = 0; kb < k / 16; ++kb) {
+            for (std::size_t nb = 0; nb < n / 16; ++nb) {
+                float tile[256];
+                exl3_decode_inner_tile(m.trellis.data() + (kb * (n / 16) + nb) * 64, tile);
+                for (std::size_t i = 0; i < 16; ++i)
+                    for (std::size_t j = 0; j < 16; ++j)
+                        output[nb * 16 + j] += transformed[kb * 16 + i] * tile[i * 16 + j];
+            }
+        }
+        hadamard128(output);
+        for (std::size_t j = 0; j < n; ++j) {
+            output[j] = output[j] * fp16_to_f32(m.svh[j]) + (m.bias.empty() ? 0.0 : fp16_to_f32(m.bias[j]));
+            if (!std::isfinite(output[j])) throw std::overflow_error("EXL3 reference output overflow");
+        }
+    }
+    return result;
 }
 
 }  // namespace ninfer::glm53

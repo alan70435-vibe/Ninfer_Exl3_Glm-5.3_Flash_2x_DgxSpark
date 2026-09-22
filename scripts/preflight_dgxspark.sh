@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
 set -euo pipefail
+SCRIPT_DIR=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
 
 usage() {
   cat <<'USAGE'
@@ -48,7 +49,7 @@ need_cmd() {
   fi
 }
 
-for cmd in ip nvidia-smi ethtool; do need_cmd "$cmd"; done
+for cmd in ip nvidia-smi ethtool python3; do need_cmd "$cmd"; done
 
 arch=$(uname -m)
 if [[ "$arch" == "aarch64" || "$arch" == "arm64" ]]; then
@@ -81,23 +82,20 @@ else
 fi
 
 if command -v ip >/dev/null 2>&1; then
-  if ip -brief addr show "$net_if" >/tmp/ninfer_glm53_ip.$$ 2>/dev/null; then
-    net_line=$(cat /tmp/ninfer_glm53_ip.$$)
-    rm -f /tmp/ninfer_glm53_ip.$$
+  if net_line=$(ip -brief addr show "$net_if" 2>/dev/null); then
     if [[ "$net_line" == *"$expected_ip/"* ]]; then
       ok "$net_if owns $expected_ip"
     else
       fail "$net_if does not own expected IP $expected_ip ($net_line)"
     fi
   else
-    rm -f /tmp/ninfer_glm53_ip.$$
     fail "interface $net_if does not exist"
   fi
 fi
 
 if command -v ethtool >/dev/null 2>&1 && [[ -e "/sys/class/net/$net_if" ]]; then
-  speed=$(ethtool "$net_if" 2>/dev/null | awk -F': ' '/Speed:/{print $2; exit}')
-  link=$(ethtool "$net_if" 2>/dev/null | awk -F': ' '/Link detected:/{print $2; exit}')
+  speed=$(ethtool "$net_if" 2>/dev/null | awk -F': ' '/Speed:/{print $2; exit}' || true)
+  link=$(ethtool "$net_if" 2>/dev/null | awk -F': ' '/Link detected:/{print $2; exit}' || true)
   if [[ "$speed" == "200000Mb/s" ]]; then
     ok "$net_if speed=$speed"
   else
@@ -110,16 +108,16 @@ if command -v ethtool >/dev/null 2>&1 && [[ -e "/sys/class/net/$net_if" ]]; then
   fi
 fi
 
-gid_path="/sys/class/infiniband/$ib_dev/ports/1/gids/$gid_index"
-if [[ -r "$gid_path" ]]; then
-  gid=$(tr -d '[:space:]' < "$gid_path")
-  if [[ -n "$gid" && "$gid" != "0000:0000:0000:0000:0000:0000:0000:0000" ]]; then
-    ok "$ib_dev GID[$gid_index]=$gid"
+# A nonzero GID is insufficient: validate the selected RDMA entry's netdev,
+# address and RoCE version together. Missing evidence is a failed preflight.
+if command -v python3 >/dev/null 2>&1; then
+  if python3 "$SCRIPT_DIR/roce_gid.py" --ib-device "$ib_dev" --interface "$net_if" \
+      --ip "$expected_ip" --gid-index "$gid_index" \
+      --nccl-index "${NCCL_IB_GID_INDEX:?NCCL_IB_GID_INDEX missing}"; then
+    ok "RoCE GID netdev/type/IP contract verified"
   else
-    fail "$ib_dev GID[$gid_index] is empty/zero"
+    fail "RoCE GID netdev/type/IP contract failed or unverified"
   fi
-else
-  fail "missing RoCE GID path $gid_path"
 fi
 
 if command -v nvcc >/dev/null 2>&1; then
