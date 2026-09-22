@@ -122,20 +122,26 @@ void pack_trellis_k4(const std::uint16_t symbols[256], std::uint16_t packed[kExl
 }
 
 void unpack_trellis_k4(const std::uint16_t packed[kExl3PackedU16], std::uint16_t symbols[256]) {
-    std::uint16_t staged[kExl3PackedU16];
-    for (int pair = 0; pair < kExl3PackedU16 / 2; ++pair) {
-        const std::uint32_t joined = static_cast<std::uint32_t>(packed[pair * 2]) |
-                                     (static_cast<std::uint32_t>(packed[pair * 2 + 1]) << 16);
-        const std::uint32_t swapped = swap16_lanes(joined);
-        staged[pair * 2] = static_cast<std::uint16_t>(swapped & 0xffffu);
-        staged[pair * 2 + 1] = static_cast<std::uint16_t>(swapped >> 16);
+    // ExLlamaV3 unpack_trellis_kernel<4>. Each step stores K bits; the value
+    // fed to the MCG codebook is the overlapping 16-bit window, not that nibble.
+    constexpr int k_bits = 4;
+    std::uint32_t words[32];
+    for (int index = 0; index < 32; ++index) {
+        words[index] = static_cast<std::uint32_t>(packed[index * 2]) |
+                       (static_cast<std::uint32_t>(packed[index * 2 + 1]) << 16);
     }
-    for (int span = 0; span < 16; ++span) {
-        std::uint64_t chunk = 0;
-        for (int word = 0; word < 4; ++word) chunk = (chunk << 16) | staged[span * 4 + word];
-        for (int n = 0; n < 16; ++n) {
-            symbols[span * 16 + n] = static_cast<std::uint16_t>((chunk >> (60 - 4 * n)) & 0xfu);
-        }
+    for (int thread = 0; thread < 128; ++thread) {
+        const int bit0 = thread * 2 * k_bits + k_bits - 16 + 256 * k_bits;
+        const int bit2 = bit0 + k_bits + 16;
+        const int word0 = bit0 / 32;
+        const int word1 = (bit2 - 1) / 32;
+        const int align = (word1 + 1) * 32 - bit2;
+        const std::uint32_t hi = words[word0 % 32];
+        const std::uint32_t lo = words[word1 % 32];
+        const std::uint64_t wide = (static_cast<std::uint64_t>(hi) << 32) | lo;
+        const std::uint32_t window = static_cast<std::uint32_t>(wide >> align);
+        symbols[thread * 2] = static_cast<std::uint16_t>((window >> k_bits) & 0xffffu);
+        symbols[thread * 2 + 1] = static_cast<std::uint16_t>(window & 0xffffu);
     }
 }
 

@@ -17,8 +17,9 @@ target (150226 tensors) and DFlash2 draft (81 tensors) bind completely on CPU
 metadata, including EXL3 storage shapes and the MCG multiplier. See
 [`docs/checkpoint-binding.md`](docs/checkpoint-binding.md).
 
-The repository is otherwise still pre-kernel. P2 is the EXL3/TR3 encoded
-representation and rank-local memory plan.
+`ninfer-glm53-generate` runs a CPU eager text forward. Routed experts use the
+EXL3 trellis with the 128-point Hadamard reconstruct. CUDA kernels, NCCL and
+the serving API are not in place.
 
 NVFP4 runtime work continues in [Ninfer_Nvfp4_Glm-5.3_Flash_2x_DgxSpark](https://github.com/alan70435/Ninfer_Nvfp4_Glm-5.3_Flash_2x_DgxSpark). This repository keeps the EXL3 binding line.
 

@@ -24,30 +24,26 @@ int main() {
     expect(perm[0] == 0 && perm[1] == 16 && perm[2] == 128 && perm[3] == 144, "tensor-core perm head");
     expect(perm[4] == 8 && perm[5] == 24 && perm[6] == 136 && perm[7] == 152, "tensor-core perm tail");
 
-    std::uint16_t symbols[256];
-    for (int i = 0; i < 256; ++i) symbols[i] = static_cast<std::uint16_t>((i * 3) & 15);
     std::uint16_t packed[kExl3PackedU16];
-    std::uint16_t unpacked[256];
-    pack_trellis_k4(symbols, packed);
-    unpack_trellis_k4(packed, unpacked);
-    for (int i = 0; i < 256; ++i) {
-        if ((unpacked[i] & 15) != symbols[i]) {
-            std::cerr << "trellis round trip failed at " << i << '\n';
-            return 1;
-        }
-    }
+    std::uint16_t states[256];
+    for (auto& word : packed) word = 0xffffu;
+    unpack_trellis_k4(packed, states);
+    for (const auto state : states) expect(state == 0xffffu, "all-ones tile is state 65535");
+    expect(near(mcg_symbol(states[0]), mcg_symbol(0xffffu)), "all-ones mcg uses the 16-bit state");
+    expect(std::fabs(mcg_symbol(0xffffu) - mcg_symbol(0xfu)) > 0.1f, "nibble 15 is not state 65535");
 
-    for (int i = 0; i < 256; ++i) symbols[i] = 0;
-    int slot00 = -1;
-    int slot01 = -1;
-    for (int p = 0; p < 256; ++p) {
-        if (perm[p] == 0) slot00 = p;
-        if (perm[p] == 1) slot01 = p;
-    }
-    expect(slot00 == 0 && slot01 >= 0, "row-major slots");
-    symbols[slot00] = 2;
-    symbols[slot01] = 4;
-    pack_trellis_k4(symbols, packed);
+    for (auto& word : packed) word = 0;
+    unpack_trellis_k4(packed, states);
+    for (const auto state : states) expect(state == 0, "all-zero tile is state 0");
+
+    // Non-periodic payload. Expected windows come from the published bit schedule, not from pack_trellis_k4.
+    for (int i = 0; i < kExl3PackedU16; ++i) packed[i] = static_cast<std::uint16_t>(0x1111u * static_cast<unsigned>(i + 1));
+    unpack_trellis_k4(packed, states);
+    expect(states[0] == 0x32f2u && states[1] == 0x2f22u, "cross-word window 0");
+    expect(states[16] == 0x3336u && states[17] == 0x3366u, "cross-word window 8");
+    expect(states[254] == 0x0332u && states[255] == 0x332fu, "wrapped tail window");
+
+    for (auto& word : packed) word = 0;
     float suh[16];
     float svh[16];
     for (int i = 0; i < 16; ++i) {
@@ -62,8 +58,8 @@ int main() {
     float x[16] = {1.f};
     float y[16] = {};
     exl3_gemv_tile(x, tile, y);
-    // CUDA __hadd oracle for MCG symbols 2 and 4.
-    expect(near(y[0], -0.759277344f * 2.f * 0.5f), "exl3 gemv column 0");
-    expect(near(y[1], 0.665039062f * 2.f * 3.f), "exl3 gemv column 1");
+    const float symbol0 = mcg_symbol(0);
+    expect(near(y[0], symbol0 * 2.f * 0.5f), "exl3 gemv column 0");
+    expect(near(y[1], symbol0 * 2.f * 3.f), "exl3 gemv column 1");
     return 0;
 }
