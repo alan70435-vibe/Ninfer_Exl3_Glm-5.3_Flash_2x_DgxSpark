@@ -1,6 +1,7 @@
 #pragma once
 
 #include "ninfer_glm53/model_spec.hpp"
+#include "ninfer_glm53/exl3_abi.hpp"
 
 #include <array>
 #include <cstdint>
@@ -26,10 +27,6 @@ enum class StorageClass : std::uint8_t {
     kExl3TrellisI16,
     kExl3McgI32,
 };
-
-// ExLlamaV3 MCG multiplier stored in every routed-expert `.mcg` tensor.
-// Measured on the TR3 4 bpw checkpoint and recorded in exl3-mcg-storage-abi.json.
-inline constexpr std::uint32_t kExl3McgMultiplier = 0xCBAC1FEDu;
 
 struct VisionSpec {
     std::uint32_t depth{};

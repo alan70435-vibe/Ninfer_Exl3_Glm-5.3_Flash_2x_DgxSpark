@@ -4,18 +4,61 @@ on:
   push:
   pull_request:
 
+permissions:
+  contents: read
+
 jobs:
   contract-tests:
     runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - profile: gcc-release
+            cxx: g++
+            build_type: Release
+            flags: ""
+          - profile: gcc-debug
+            cxx: g++
+            build_type: Debug
+            flags: ""
+          - profile: clang-sanitize
+            cxx: clang++
+            build_type: Debug
+            flags: "-fsanitize=address,undefined -fno-omit-frame-pointer"
+    env:
+      CXX: ${{ matrix.cxx }}
+      ASAN_OPTIONS: detect_leaks=1:halt_on_error=1
+      UBSAN_OPTIONS: halt_on_error=1:print_stacktrace=1
     steps:
       - uses: actions/checkout@v4
       - name: Configure
-        run: cmake -S . -B build -DCMAKE_BUILD_TYPE=Release -DNINFER_GLM53_BUILD_TESTS=ON
+        env:
+          HOST_BUILD_TYPE: ${{ matrix.build_type }}
+          HOST_FLAGS: ${{ matrix.flags }}
+        run: |
+          mkdir -p logs
+          git rev-parse HEAD > logs/source-sha.txt
+          "$CXX" --version > logs/compiler.txt
+          cmake --version > logs/cmake.txt
+          cmake -S . -B build -DCMAKE_BUILD_TYPE="$HOST_BUILD_TYPE" -DCMAKE_CXX_FLAGS="$HOST_FLAGS" -DNINFER_GLM53_BUILD_TESTS=ON 2>&1 | tee logs/configure.txt
       - name: Build
-        run: cmake --build build --parallel 2
+        run: cmake --build build --parallel 2 2>&1 | tee logs/build.txt
       - name: Test
-        run: ctest --test-dir build --output-on-failure
-      - name: Python syntax
-        run: python3 -m py_compile scripts/checkpoint_manifest.py
-      - name: Shell syntax
-        run: bash -n scripts/preflight_dgxspark.sh
+        run: ctest --test-dir build --output-on-failure --output-junit test-results.xml 2>&1 | tee logs/tests.txt
+      - name: Script syntax
+        run: |
+          python3 -m py_compile scripts/checkpoint_manifest.py scripts/checkpoint_io.py scripts/roce_gid.py scripts/validate_host_progress.py
+          bash -n scripts/preflight_dgxspark.sh
+      - name: Retain validation evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: host-${{ matrix.profile }}-${{ github.sha }}
+          path: |
+            logs/
+            build/test-results.xml
+            build/Testing/Temporary/LastTest.log
+          if-no-files-found: warn
+          retention-days: 14

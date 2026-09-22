@@ -17,8 +17,12 @@ target (150226 tensors) and DFlash2 draft (81 tensors) bind completely on CPU
 metadata, including EXL3 storage shapes and the MCG multiplier. See
 [`docs/checkpoint-binding.md`](docs/checkpoint-binding.md).
 
-The repository is otherwise still pre-kernel. P2 is the EXL3/TR3 encoded
-representation and rank-local memory plan.
+This main-line path is still pre-GPU. It now includes a tested CPU EXL3 K4
+state decoder and original-basis H128 linear reference, plus corrected greedy
+local commit helpers. These are not a complete model runtime. The separate
+v0.26 native runtime remains unmerged; its tests are not main-line GPU evidence.
+See [`docs/host-correctness-20260922.md`](docs/host-correctness-20260922.md) for
+this increment's validation scope and outstanding issues.
 
 NVFP4 runtime work continues in [Ninfer_Nvfp4_Glm-5.3_Flash_2x_DgxSpark](https://github.com/alan70435/Ninfer_Nvfp4_Glm-5.3_Flash_2x_DgxSpark). This repository keeps the EXL3 binding line.
 
@@ -39,11 +43,15 @@ Implemented now:
 - local checkpoint config/shard manifest scanner;
 - logical parameter catalog for the target, next-token module, vision tower, and DFlash2 draft;
 - strict checkpoint binder with safetensors header and MCG-multiplier checks;
-- host build and CTest coverage plus GitHub Actions host CI.
+- host build and CTest coverage plus GitHub Actions host CI;
+- CPU EXL3 state/MCG/inner-tile and original-basis H128 linear references;
+- greedy local prefix-plus-correction/bonus helpers (not distributed state commit);
+- scanner-only trusted-root, tensor-range and empty-inventory checks;
+- RoCE GID netdev/type/IP cross-validation and focused regression fixtures.
 
 Not implemented yet—and deliberately **not faked with placeholder kernels**:
 
-- decoded EXL3/TR3 materialization (storage shapes are bound; the trellis is not decoded);
+- checkpoint-backed EXL3 reader qualification and rank-local materialization/memory plan;
 - CUDA/SM121 kernels for GLM KDA, sparse MLA/indexer and MoE;
 - NCCL/RoCE TP2 process runtime;
 - target/draft GPU execution and DFlash2 verification;
@@ -124,7 +132,12 @@ python3 scripts/checkpoint_manifest.py /path/to/GLM-5.3-Flash-EXL3 \
 ```
 
 Add `--hash-shards` only when a full byte-level receipt is useful; large EXL3
-shards can make that operation expensive.
+shards can make that operation expensive. External cache symlinks require
+`--trusted-root /approved/cache/blobs` (repeatable). Scanner schema 3 separates
+index-declared and header-observed counts; successful inventory is not complete
+model coverage, payload authentication or GPU qualification. The C++ binder
+still needs independent config/path/storage hardening; the scanner does not
+silently replace that admission gate.
 
 ## Design rule
 

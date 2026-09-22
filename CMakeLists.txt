@@ -43,9 +43,16 @@ if(NINFER_GLM53_BUILD_TESTS)
     include(CTest)
     enable_testing()
 
-    foreach(test_name IN ITEMS model_spec deployment_contract execution_plan checkpoint_binding exl3_decode tiny_layer speculative)
+    foreach(test_name IN ITEMS model_spec deployment_contract execution_plan checkpoint_binding exl3_decode exl3_linear tiny_layer speculative public_headers)
         add_executable(test_${test_name} tests/test_${test_name}.cpp)
         target_link_libraries(test_${test_name} PRIVATE ninfer_glm53_core)
         add_test(NAME ${test_name} COMMAND test_${test_name})
     endforeach()
+    find_package(Python3 3.11 REQUIRED COMPONENTS Interpreter)
+    add_test(NAME host_python_regressions
+        COMMAND ${Python3_EXECUTABLE} -m unittest discover -s tests -p "test_host_*.py" -v)
+    set_tests_properties(host_python_regressions PROPERTIES
+        WORKING_DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}"
+        ENVIRONMENT "CXX=${CMAKE_CXX_COMPILER}"
+        TIMEOUT 180)
 endif()
