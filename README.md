@@ -21,7 +21,9 @@ metadata, including EXL3 storage shapes and the MCG multiplier. See
 EXL3 trellis with the 128-point Hadamard reconstruct. The same tree has a
 tested K4 state decoder, an original-basis H128 linear reference, and local
 DFlash2 commit helpers. CUDA kernels, NCCL and the serving API are not in
-place. The separate v0.26 native runtime remains unmerged. See
+place. The separate v0.26 native runtime remains unmerged. The construction
+record, including the Blackwell target and the external-token gap, is
+[`docs/build-log.md`](docs/build-log.md). Host-check scope is
 [`docs/host-correctness-20260922.md`](docs/host-correctness-20260922.md).
 
 NVFP4 runtime work continues in [Ninfer_Nvfp4_Glm-5.3_Flash_2x_DgxSpark](https://github.com/alan70435/Ninfer_Nvfp4_Glm-5.3_Flash_2x_DgxSpark). This repository keeps the EXL3 binding line.
