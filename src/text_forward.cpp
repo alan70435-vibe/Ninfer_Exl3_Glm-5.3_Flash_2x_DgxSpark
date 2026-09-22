@@ -55,6 +55,16 @@ float bf16_to_f32(std::uint16_t bits) {
     return out;
 }
 
+std::uint16_t f32_to_bf16(float value) {
+    std::uint32_t bits = 0;
+    std::memcpy(&bits, &value, sizeof(bits));
+    const std::uint32_t lsb = (bits >> 16) & 1U;
+    const std::uint32_t round = 0x7fffU + lsb;
+    if ((bits & 0x7fffffffU) > 0x7f800000U) return static_cast<std::uint16_t>(bits >> 16);
+    bits += round;
+    return static_cast<std::uint16_t>(bits >> 16);
+}
+
 float fp16_to_f32(std::uint16_t bits) {
     const std::uint32_t sign = static_cast<std::uint32_t>(bits & 0x8000u) << 16;
     const std::uint32_t exp = (bits >> 10) & 0x1fu;
@@ -603,6 +613,9 @@ public:
         for (std::size_t layer = 0; layer < spec_.layers.size(); ++layer) {
             mix(static_cast<int>(layer), spec_.layers[layer].mixer, "hc_attn_", "input_layernorm.weight");
             feed(static_cast<int>(layer), spec_.layers[layer].ffn);
+            // Serving kernels keep the mHC streams in bf16. Leaving them in
+            // fp32 changes a close argmax after the capture KDA state is applied.
+            for (float& value : streams_state_) value = bf16_to_f32(f32_to_bf16(value));
             if (capture_taps_) record_tap(static_cast<int>(layer));
         }
         std::vector<float> mean(static_cast<std::size_t>(hidden_), 0.f);
@@ -669,6 +682,17 @@ public:
     }
 
     void set_capture(bool enabled) { capture_taps_ = enabled; }
+
+    // CUDA-graph capture fills input ids with token 0. The serving block
+    // zeroer clears attention pages and skips mamba, so a fresh request
+    // reads that KDA state with an empty MLA cache.
+    void prime_capture_kda() {
+        step(0);
+        for (auto& cache : mla_) {
+            cache.latents.clear();
+            cache.tokens = 0;
+        }
+    }
 
     [[nodiscard]] const float* tap(int index) const { return taps_[static_cast<std::size_t>(index)].data(); }
 
@@ -1510,6 +1534,7 @@ bool fixed_prompt_tokens(std::string_view prompt_id, std::string& text, std::vec
 namespace {
 
 std::vector<std::int32_t> greedy_tokens(TextModel& model, const std::vector<std::int32_t>& prompt, int new_tokens) {
+    model.prime_capture_kda();
     model.set_capture(true);
     for (const auto token : prompt) model.step(token);
     model.set_capture(false);
@@ -1527,6 +1552,7 @@ std::vector<std::int32_t> greedy_tokens(TextModel& model, const std::vector<std:
 std::vector<std::int32_t> dflash_tokens(TextModel& model, const Store& draft, const std::vector<std::int32_t>& prompt,
                                        int new_tokens, std::vector<std::int32_t>& proposals, int& accepted,
                                        int& verify_rounds, std::string& finish) {
+    model.prime_capture_kda();
     const DflashOutput output = generate_dflash_continuation(
         model, [&](std::int32_t anchor) { return propose_dflash(model, draft, anchor); }, prompt, new_tokens);
     proposals = output.last_proposals;
