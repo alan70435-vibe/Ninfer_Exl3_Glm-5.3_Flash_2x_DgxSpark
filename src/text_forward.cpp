@@ -1,23 +1,30 @@
 #include "ninfer_glm53/text_forward.hpp"
 
 #include "json_scan.hpp"
+#include "ninfer_glm53/dflash_loop.hpp"
 #include "ninfer_glm53/model_spec.hpp"
 #include "ninfer_glm53/exl3_decode.hpp"
 #include "ninfer_glm53/speculative.hpp"
 
 #include <algorithm>
+#include <cerrno>
+#include <chrono>
 #include <cmath>
+#include <cstdint>
 #include <cstdlib>
 #include <cstring>
 #include <fcntl.h>
 #include <fstream>
 #include <iostream>
+#include <optional>
+#include <poll.h>
 #include <stdexcept>
 #include <sys/mman.h>
 #include <sys/socket.h>
 #include <sys/stat.h>
 #include <sys/wait.h>
 #include <unordered_map>
+#include <unordered_set>
 #include <unistd.h>
 #include <utility>
 
@@ -92,12 +99,41 @@ void fwht128(float* values) {
     for (int index = 0; index < 128; ++index) values[index] *= scale;
 }
 
+// One deadline per call. 30s is a GEMV exchange, not a shorter test budget.
+constexpr auto kRankLinkTimeout = std::chrono::seconds(30);
+
+[[nodiscard]] int link_poll_ms(std::chrono::steady_clock::time_point deadline) {
+    const auto now = std::chrono::steady_clock::now();
+    if (now >= deadline) return -1;
+    const auto remain = std::chrono::duration_cast<std::chrono::milliseconds>(deadline - now).count();
+    if (remain <= 0) return 0;
+    if (remain > 30000) return 30000;
+    return static_cast<int>(remain);
+}
+
 void send_all(int fd, const void* data, std::size_t bytes) {
     const auto* cursor = static_cast<const char*>(data);
     std::size_t done = 0;
+    const auto deadline = std::chrono::steady_clock::now() + kRankLinkTimeout;
     while (done < bytes) {
+        const int timeout_ms = link_poll_ms(deadline);
+        if (timeout_ms < 0) fail("rank link send timeout");
+        pollfd ready{};
+        ready.fd = fd;
+        ready.events = POLLOUT;
+        const int polled = ::poll(&ready, 1, timeout_ms);
+        if (polled < 0) {
+            if (errno == EINTR) continue;
+            fail("rank link send failed");
+        }
+        if (polled == 0) fail("rank link send timeout");
+        if ((ready.revents & POLLOUT) == 0) fail("rank link send failed");
         const ssize_t wrote = ::send(fd, cursor + done, bytes - done, MSG_NOSIGNAL);
-        if (wrote <= 0) fail("rank link send failed");
+        if (wrote < 0) {
+            if (errno == EINTR || errno == EAGAIN || errno == EWOULDBLOCK) continue;
+            fail("rank link send failed");
+        }
+        if (wrote == 0) fail("rank link send failed");
         done += static_cast<std::size_t>(wrote);
     }
 }
@@ -105,12 +141,120 @@ void send_all(int fd, const void* data, std::size_t bytes) {
 void recv_all(int fd, void* data, std::size_t bytes) {
     auto* cursor = static_cast<char*>(data);
     std::size_t done = 0;
+    const auto deadline = std::chrono::steady_clock::now() + kRankLinkTimeout;
     while (done < bytes) {
+        const int timeout_ms = link_poll_ms(deadline);
+        if (timeout_ms < 0) fail("rank link recv timeout");
+        pollfd ready{};
+        ready.fd = fd;
+        ready.events = POLLIN;
+        const int polled = ::poll(&ready, 1, timeout_ms);
+        if (polled < 0) {
+            if (errno == EINTR) continue;
+            fail("rank link recv failed");
+        }
+        if (polled == 0) fail("rank link recv timeout");
+        if ((ready.revents & POLLIN) == 0) fail("rank link recv failed");
         const ssize_t got = ::recv(fd, cursor + done, bytes - done, 0);
-        if (got <= 0) fail("rank link recv failed");
+        if (got < 0) {
+            if (errno == EINTR || errno == EAGAIN || errno == EWOULDBLOCK) continue;
+            fail("rank link recv failed");
+        }
+        if (got == 0) fail("rank link recv failed");
         done += static_cast<std::size_t>(got);
     }
 }
+
+void set_nonblock(int fd) {
+    const int flags = ::fcntl(fd, F_GETFL, 0);
+    if (flags < 0) fail("rank link nonblock failed");
+    if (::fcntl(fd, F_SETFL, flags | O_NONBLOCK) < 0) fail("rank link nonblock failed");
+}
+
+// Closes once. Move leaves the source empty.
+class SocketFd {
+public:
+    SocketFd() = default;
+    explicit SocketFd(int fd) noexcept : fd_(fd) {}
+    SocketFd(const SocketFd&) = delete;
+    SocketFd& operator=(const SocketFd&) = delete;
+    SocketFd(SocketFd&& other) noexcept : fd_(std::exchange(other.fd_, -1)) {}
+    SocketFd& operator=(SocketFd&& other) noexcept {
+        if (this != &other) {
+            reset();
+            fd_ = std::exchange(other.fd_, -1);
+        }
+        return *this;
+    }
+    ~SocketFd() { reset(); }
+
+    [[nodiscard]] int get() const { return fd_; }
+
+    void reset() noexcept {
+        if (fd_ < 0) return;
+        const int fd = fd_;
+        fd_ = -1;
+        ::close(fd);
+    }
+
+private:
+    int fd_ = -1;
+};
+
+// Parent-only. Destructor reaps with waitpid, retrying EINTR. WIFSIGNALED is failure.
+class ChildProcess {
+public:
+    explicit ChildProcess(pid_t pid) noexcept : pid_(pid) {}
+    ChildProcess(const ChildProcess&) = delete;
+    ChildProcess& operator=(const ChildProcess&) = delete;
+    ChildProcess(ChildProcess&& other) noexcept
+        : pid_(std::exchange(other.pid_, -1)),
+          status_(std::exchange(other.status_, 0)),
+          waited_(std::exchange(other.waited_, false)),
+          reaped_(std::exchange(other.reaped_, true)) {}
+    ChildProcess& operator=(ChildProcess&& other) noexcept {
+        if (this != &other) {
+            reap();
+            pid_ = std::exchange(other.pid_, -1);
+            status_ = std::exchange(other.status_, 0);
+            waited_ = std::exchange(other.waited_, false);
+            reaped_ = std::exchange(other.reaped_, true);
+        }
+        return *this;
+    }
+    ~ChildProcess() { reap(); }
+
+    void reap() noexcept {
+        if (reaped_) return;
+        reaped_ = true;
+        if (pid_ <= 0) return;
+        for (;;) {
+            const pid_t got = ::waitpid(pid_, &status_, 0);
+            if (got == pid_) {
+                waited_ = true;
+                return;
+            }
+            if (got < 0 && errno == EINTR) continue;
+            return;
+        }
+    }
+
+    [[nodiscard]] bool exited_ok() const { return waited_ && WIFEXITED(status_) && WEXITSTATUS(status_) == 0; }
+    [[nodiscard]] int status() const { return status_; }
+
+private:
+    pid_t pid_ = -1;
+    int status_ = 0;
+    bool waited_ = false;
+    bool reaped_ = false;
+};
+
+// child is first so it is destroyed last: socket destructors close, then waitpid.
+struct RankSession {
+    std::optional<ChildProcess> child;
+    SocketFd parent_end;
+    SocketFd child_end;
+};
 
 void gather_rows(int fd, int rank, float* values, int rows) {
     if (fd < 0 || rows <= 0) return;
@@ -147,10 +291,45 @@ std::int64_t dim_at(const Tensor& tensor, int axis) {
     return tensor.shape[axis];
 }
 
-struct Mapping {
-    void* address = nullptr;
-    std::size_t length = 0;
-    int fd = -1;
+// Owns one mapped shard. Move leaves the source empty so vector growth does not double-close.
+class MappedShard {
+public:
+    MappedShard() = default;
+    MappedShard(void* address, std::size_t length, int fd) noexcept : address_(address), length_(length), fd_(fd) {}
+    MappedShard(const MappedShard&) = delete;
+    MappedShard& operator=(const MappedShard&) = delete;
+    MappedShard(MappedShard&& other) noexcept
+        : address_(std::exchange(other.address_, nullptr)),
+          length_(std::exchange(other.length_, std::size_t{0})),
+          fd_(std::exchange(other.fd_, -1)) {}
+    MappedShard& operator=(MappedShard&& other) noexcept {
+        if (this != &other) {
+            reset();
+            address_ = std::exchange(other.address_, nullptr);
+            length_ = std::exchange(other.length_, std::size_t{0});
+            fd_ = std::exchange(other.fd_, -1);
+        }
+        return *this;
+    }
+    ~MappedShard() { reset(); }
+
+    [[nodiscard]] void* address() const { return address_; }
+    [[nodiscard]] std::size_t length() const { return length_; }
+
+    void reset() noexcept {
+        if (address_ != nullptr && address_ != MAP_FAILED) ::munmap(address_, length_);
+        address_ = nullptr;
+        length_ = 0;
+        if (fd_ < 0) return;
+        const int fd = fd_;
+        fd_ = -1;
+        ::close(fd);
+    }
+
+private:
+    void* address_ = nullptr;
+    std::size_t length_ = 0;
+    int fd_ = -1;
 };
 
 class Store {
@@ -189,9 +368,10 @@ public:
         cursor.expect('}');
         }
 
-        std::unordered_map<std::string, Mapping*> opened;
+        std::unordered_set<std::string> opened;
+        maps_.reserve(shard_of.size());
         for (const auto& entry : shard_of) {
-            if (opened.find(entry.second) != opened.end()) continue;
+            if (!opened.insert(entry.second).second) continue;
             const auto path = directory / entry.second;
             const int fd = ::open(path.c_str(), O_RDONLY);
             if (fd < 0) fail("cannot open shard " + path.string());
@@ -205,18 +385,18 @@ public:
                 ::close(fd);
                 fail("cannot map shard " + path.string());
             }
-            maps_.push_back(Mapping{address, static_cast<std::size_t>(info.st_size), fd});
-            opened.emplace(entry.second, &maps_.back());
+            MappedShard owner(address, static_cast<std::size_t>(info.st_size), fd);
+            maps_.push_back(std::move(owner));
         }
 
-        for (auto& map : maps_) {
-            if (map.length < 8U) fail("short safetensors file");
-            const auto* bytes = static_cast<const unsigned char*>(map.address);
+        for (const auto& map : maps_) {
+            if (map.length() < 8U) fail("short safetensors file");
+            const auto* bytes = static_cast<const unsigned char*>(map.address());
             std::uint64_t header_len = 0;
             for (int i = 0; i < 8; ++i) {
                 header_len |= static_cast<std::uint64_t>(bytes[i]) << static_cast<unsigned>(i * 8);
             }
-            if (header_len == 0U || 8U + header_len > map.length) fail("bad safetensors header");
+            if (header_len == 0U || 8U + header_len > map.length()) fail("bad safetensors header");
             const std::string_view header(reinterpret_cast<const char*>(bytes + 8), static_cast<std::size_t>(header_len));
             const auto* data = bytes + 8 + header_len;
             json_scan::Cursor header_cursor(header);
@@ -285,18 +465,10 @@ public:
                 break;
             }
         }
-        (void)opened;
     }
 
     Store(const Store&) = delete;
     Store& operator=(const Store&) = delete;
-
-    ~Store() {
-        for (const auto& map : maps_) {
-            if (map.address != nullptr && map.address != MAP_FAILED) ::munmap(map.address, map.length);
-            if (map.fd >= 0) ::close(map.fd);
-        }
-    }
 
     [[nodiscard]] const Tensor& get(const std::string& name) const {
         const auto found = tensors_.find(name);
@@ -327,7 +499,7 @@ public:
     }
 
 private:
-    std::vector<Mapping> maps_;
+    std::vector<MappedShard> maps_;
     std::unordered_map<std::string, Tensor> tensors_;
 };
 
@@ -1179,16 +1351,29 @@ void kda_forget_gate(const float* proj, const float* dt_bias, const float* a_log
 }
 
 void causal_conv_silu(const float* x, const float* weight, float* mem, int channels, int kernel, float* y) {
+    if (kernel < 1) fail("causal conv kernel");
+    if (channels > 0 && x != y) {
+        const auto bytes = static_cast<std::uintptr_t>(channels) * sizeof(float);
+        const auto left = reinterpret_cast<std::uintptr_t>(x);
+        const auto right = reinterpret_cast<std::uintptr_t>(y);
+        const auto delta = left > right ? left - right : right - left;
+        if (delta < bytes) fail("causal conv partial overlap");
+    }
     const int history = kernel - 1;
     for (int channel = 0; channel < channels; ++channel) {
+        const float raw = x[channel];
         const float* taps = weight + static_cast<std::size_t>(channel) * static_cast<std::size_t>(kernel);
+        if (history == 0) {
+            y[channel] = silu(taps[0] * raw);
+            continue;
+        }
         float* state = mem + static_cast<std::size_t>(channel) * static_cast<std::size_t>(history);
         float acc = 0.f;
         for (int tap = 0; tap < history; ++tap) acc += taps[tap] * state[tap];
-        acc += taps[history] * x[channel];
+        acc += taps[history] * raw;
         y[channel] = silu(acc);
         for (int tap = 0; tap < history - 1; ++tap) state[tap] = state[tap + 1];
-        if (history > 0) state[history - 1] = x[channel];
+        state[history - 1] = raw;
     }
 }
 
@@ -1330,59 +1515,25 @@ std::vector<std::int32_t> greedy_tokens(TextModel& model, const std::vector<std:
     model.set_capture(false);
     std::vector<std::int32_t> generated;
     generated.reserve(static_cast<std::size_t>(new_tokens));
-    for (int index = 0; index < new_tokens; ++index) {
-        generated.push_back(model.argmax());
-        if (index + 1 < new_tokens) model.step(generated.back());
+    while (static_cast<int>(generated.size()) < new_tokens) {
+        const auto token = model.argmax();
+        generated.push_back(token);
+        if (is_text_eos(token) || static_cast<int>(generated.size()) == new_tokens) break;
+        model.step(token);
     }
     return generated;
 }
 
 std::vector<std::int32_t> dflash_tokens(TextModel& model, const Store& draft, const std::vector<std::int32_t>& prompt,
-                                       int new_tokens, std::vector<std::int32_t>& proposals, int& accepted) {
-    model.set_capture(true);
-    for (const auto token : prompt) model.step(token);
-    model.set_capture(false);
-    const auto anchor = model.argmax();
-    proposals = propose_dflash(model, draft, anchor);
-    if (proposals.size() != 7U) fail("DFlash proposal count");
-    std::vector<std::int32_t> block;
-    block.push_back(anchor);
-    block.insert(block.end(), proposals.begin(), proposals.end());
-    std::vector<std::int32_t> posterior;
-    posterior.reserve(block.size());
-    for (const auto token : block) {
-        model.step(token);
-        posterior.push_back(model.argmax());
-    }
-    accepted = 0;
-    while (accepted < 7 && proposals[static_cast<std::size_t>(accepted)] == posterior[static_cast<std::size_t>(accepted)]) {
-        ++accepted;
-    }
-    const int bonus = posterior[static_cast<std::size_t>(accepted)];
-    std::vector<std::int32_t> sequence;
-    sequence.push_back(anchor);
-    for (int index = 0; index < accepted; ++index) sequence.push_back(proposals[static_cast<std::size_t>(index)]);
-    sequence.push_back(bonus);
-    if (static_cast<int>(sequence.size()) > new_tokens) sequence.resize(static_cast<std::size_t>(new_tokens));
-    RankRecord rank0;
-    RankRecord rank1;
-    std::vector<std::int32_t> target(8, 0);
-    target[0] = anchor;
-    for (int index = 0; index < 7; ++index) target[static_cast<std::size_t>(index)] = posterior[static_cast<std::size_t>(index)] == proposals[static_cast<std::size_t>(index)]
-                                                                                            ? proposals[static_cast<std::size_t>(index)]
-                                                                                            : posterior[static_cast<std::size_t>(index)];
-    // commit_dflash2 compares draft proposals with the verified target tokens.
-    std::vector<std::int32_t> verified(8, bonus);
-    verified[0] = posterior[0] == proposals[0] ? proposals[0] : -1;
-    for (int index = 0; index < 7; ++index) verified[static_cast<std::size_t>(index)] = proposals[static_cast<std::size_t>(index)];
-    // The shipped commit records the matching draft prefix. The logged continuation above
-    // is the temperature-0 target sequence, including the bonus token.
-    commit_dflash2(proposals.data(), kDflashProposals, posterior.data(), &rank0, &rank1);
-    (void)target;
-    (void)verified;
-    (void)rank0;
-    (void)rank1;
-    return sequence;
+                                       int new_tokens, std::vector<std::int32_t>& proposals, int& accepted,
+                                       int& verify_rounds, std::string& finish) {
+    const DflashOutput output = generate_dflash_continuation(
+        model, [&](std::int32_t anchor) { return propose_dflash(model, draft, anchor); }, prompt, new_tokens);
+    proposals = output.last_proposals;
+    accepted = output.accepted_drafts;
+    verify_rounds = output.verify_rounds;
+    finish = output.finish;
+    return output.tokens;
 }
 
 }  // namespace
@@ -1404,7 +1555,7 @@ GenerateResult generate_text(const std::filesystem::path& checkpoint, std::strin
     }
     const bool paired = mode == "tp2" || mode == "dflash";
     result.world_size = paired ? 2 : 1;
-    auto finish = [&](TextModel& model, std::vector<std::int32_t> generated) {
+    auto publish = [&](TextModel& model, std::vector<std::int32_t> generated) {
         result.logit_margin = model.margin();
         result.token_ids = std::move(generated);
         result.committed = static_cast<std::uint32_t>(result.token_ids.size());
@@ -1415,114 +1566,165 @@ GenerateResult generate_text(const std::filesystem::path& checkpoint, std::strin
             result.reason = "draft_absent";
             return result;
         }
-        int fds[2] = {-1, -1};
-        if (::socketpair(AF_UNIX, SOCK_STREAM, 0, fds) != 0) {
+        RankSession session;
+        int raw[2] = {-1, -1};
+        if (::socketpair(AF_UNIX, SOCK_STREAM, 0, raw) != 0) {
             result.reason = "socketpair_failed";
             return result;
         }
+        session.parent_end = SocketFd(raw[0]);
+        session.child_end = SocketFd(raw[1]);
         const int buffer = 4 * 1024 * 1024;
-        ::setsockopt(fds[0], SOL_SOCKET, SO_SNDBUF, &buffer, sizeof(buffer));
-        ::setsockopt(fds[0], SOL_SOCKET, SO_RCVBUF, &buffer, sizeof(buffer));
-        ::setsockopt(fds[1], SOL_SOCKET, SO_SNDBUF, &buffer, sizeof(buffer));
-        ::setsockopt(fds[1], SOL_SOCKET, SO_RCVBUF, &buffer, sizeof(buffer));
+        ::setsockopt(session.parent_end.get(), SOL_SOCKET, SO_SNDBUF, &buffer, sizeof(buffer));
+        ::setsockopt(session.parent_end.get(), SOL_SOCKET, SO_RCVBUF, &buffer, sizeof(buffer));
+        ::setsockopt(session.child_end.get(), SOL_SOCKET, SO_SNDBUF, &buffer, sizeof(buffer));
+        ::setsockopt(session.child_end.get(), SOL_SOCKET, SO_RCVBUF, &buffer, sizeof(buffer));
+        set_nonblock(session.parent_end.get());
+        set_nonblock(session.child_end.get());
+        auto produce = [&](TextModel& model, std::vector<std::int32_t>& generated, std::vector<std::int32_t>& drafts,
+                           int& accepted, int& verify_rounds, std::string& finish_reason) {
+            if (mode == "dflash") {
+                Store draft(draft_checkpoint);
+                generated = dflash_tokens(model, draft, result.prompt_tokens, new_tokens, drafts, accepted, verify_rounds,
+                                          finish_reason);
+            } else {
+                generated = greedy_tokens(model, result.prompt_tokens, new_tokens);
+                drafts.clear();
+                accepted = -1;
+                verify_rounds = 0;
+                finish_reason.clear();
+            }
+        };
         const pid_t pid = ::fork();
         if (pid < 0) {
             result.reason = "fork_failed";
             return result;
         }
-        auto produce = [&](TextModel& model, std::vector<std::int32_t>& generated, std::vector<std::int32_t>& drafts,
-                           int& accepted) {
-            if (mode == "dflash") {
-                Store draft(draft_checkpoint);
-                generated = dflash_tokens(model, draft, result.prompt_tokens, new_tokens, drafts, accepted);
-            } else {
-                generated = greedy_tokens(model, result.prompt_tokens, new_tokens);
-            }
-        };
         if (pid == 0) {
-            ::close(fds[0]);
+            session.parent_end.reset();
             try {
                 TextModel model(checkpoint, 1);
-                model.set_rank(1, fds[1]);
+                model.set_rank(1, session.child_end.get());
                 std::vector<std::int32_t> generated;
                 std::vector<std::int32_t> drafts;
                 int accepted = -1;
-                produce(model, generated, drafts, accepted);
+                int verify_rounds = 0;
+                std::string finish_reason;
+                produce(model, generated, drafts, accepted, verify_rounds, finish_reason);
                 const int count = static_cast<int>(generated.size());
-                send_all(fds[1], &count, sizeof(count));
+                send_all(session.child_end.get(), &count, sizeof(count));
                 if (count > 0) {
-                    send_all(fds[1], generated.data(), static_cast<std::size_t>(count) * sizeof(std::int32_t));
+                    send_all(session.child_end.get(), generated.data(), static_cast<std::size_t>(count) * sizeof(std::int32_t));
                 }
-                send_all(fds[1], &accepted, sizeof(accepted));
+                send_all(session.child_end.get(), &accepted, sizeof(accepted));
                 const int draft_count = static_cast<int>(drafts.size());
-                send_all(fds[1], &draft_count, sizeof(draft_count));
+                send_all(session.child_end.get(), &draft_count, sizeof(draft_count));
                 if (draft_count > 0) {
-                    send_all(fds[1], drafts.data(), static_cast<std::size_t>(draft_count) * sizeof(std::int32_t));
+                    send_all(session.child_end.get(), drafts.data(),
+                             static_cast<std::size_t>(draft_count) * sizeof(std::int32_t));
                 }
+                _exit(0);
             } catch (...) {
                 const int count = -1;
-                send_all(fds[1], &count, sizeof(count));
-            }
-            ::close(fds[1]);
-            _exit(0);
-        }
-        ::close(fds[1]);
-        TextModel model(checkpoint, 1);
-        model.set_rank(0, fds[0]);
-        std::vector<std::int32_t> generated;
-        std::vector<std::int32_t> drafts;
-        int accepted = -1;
-        produce(model, generated, drafts, accepted);
-        int child_count = 0;
-        recv_all(fds[0], &child_count, sizeof(child_count));
-        std::vector<std::int32_t> child;
-        int child_accept = -1;
-        std::vector<std::int32_t> child_draft;
-        if (child_count >= 0) {
-            if (child_count > 0) {
-                child.resize(static_cast<std::size_t>(child_count));
-                recv_all(fds[0], child.data(), static_cast<std::size_t>(child_count) * sizeof(std::int32_t));
-            }
-            recv_all(fds[0], &child_accept, sizeof(child_accept));
-            int draft_count = 0;
-            recv_all(fds[0], &draft_count, sizeof(draft_count));
-            if (draft_count > 0) {
-                child_draft.resize(static_cast<std::size_t>(draft_count));
-                recv_all(fds[0], child_draft.data(), static_cast<std::size_t>(draft_count) * sizeof(std::int32_t));
+                try {
+                    send_all(session.child_end.get(), &count, sizeof(count));
+                } catch (...) {
+                }
+                _exit(1);
             }
         }
-        ::close(fds[0]);
-        int status = 0;
-        ::waitpid(pid, &status, 0);
-        RankRecord rank0;
-        RankRecord rank1;
-        const CommitView mine{generated.data(), static_cast<std::uint32_t>(generated.size())};
-        const CommitView theirs{child.data(), static_cast<std::uint32_t>(child.size())};
-        if (child_count < 0 || !commit_same_tokens(mine, theirs, &rank0, &rank1) || drafts != child_draft ||
-            accepted != child_accept) {
-            result.reason = std::string(mode) + "_rank_mismatch child_count=" + std::to_string(child_count);
-            if (!child.empty()) result.reason += " child0=" + std::to_string(child[0]);
-            result.token_ids = generated;
+        session.child_end.reset();
+        session.child.emplace(pid);
+        try {
+            TextModel model(checkpoint, 1);
+            model.set_rank(0, session.parent_end.get());
+            std::vector<std::int32_t> generated;
+            std::vector<std::int32_t> drafts;
+            int accepted = -1;
+            int verify_rounds = 0;
+            std::string finish_reason;
+            produce(model, generated, drafts, accepted, verify_rounds, finish_reason);
+            int child_count = 0;
+            recv_all(session.parent_end.get(), &child_count, sizeof(child_count));
+            std::vector<std::int32_t> child_tokens;
+            int child_accept = -1;
+            std::vector<std::int32_t> child_draft;
+            // -1 is the failure sentinel, not a token count. Never allocate it.
+            bool protocol_ok = child_count >= 0 && child_count <= new_tokens;
+            if (protocol_ok) {
+                if (child_count > 0) {
+                    child_tokens.resize(static_cast<std::size_t>(child_count));
+                    recv_all(session.parent_end.get(), child_tokens.data(),
+                             static_cast<std::size_t>(child_count) * sizeof(std::int32_t));
+                }
+                recv_all(session.parent_end.get(), &child_accept, sizeof(child_accept));
+                int draft_count = 0;
+                recv_all(session.parent_end.get(), &draft_count, sizeof(draft_count));
+                if (draft_count < 0 || draft_count > static_cast<int>(kDflashProposals)) {
+                    protocol_ok = false;
+                } else if (draft_count > 0) {
+                    child_draft.resize(static_cast<std::size_t>(draft_count));
+                    recv_all(session.parent_end.get(), child_draft.data(),
+                             static_cast<std::size_t>(draft_count) * sizeof(std::int32_t));
+                }
+            }
+            session.parent_end.reset();
+            session.child->reap();
+            RankRecord rank0;
+            RankRecord rank1;
+            const bool child_ok = session.child->exited_ok();
+            bool same = false;
+            if (protocol_ok && child_ok) {
+                const CommitView mine{generated.data(), static_cast<std::uint32_t>(generated.size())};
+                const CommitView theirs{child_tokens.data(), static_cast<std::uint32_t>(child_tokens.size())};
+                same = commit_same_tokens(mine, theirs, &rank0, &rank1) && drafts == child_draft && accepted == child_accept;
+            }
+            if (!same) {
+                result.ok = false;
+                result.reason = std::string(mode) + "_rank_mismatch child_count=" + std::to_string(child_count);
+                if (!child_ok) result.reason += " exit_status=" + std::to_string(session.child->status());
+                if (!child_tokens.empty()) result.reason += " child0=" + std::to_string(child_tokens[0]);
+                result.token_ids = generated;
+                result.rank0_tokens = generated;
+                result.rank1_tokens = child_tokens;
+                result.committed = 0;
+                return result;
+            }
+            if (mode == "dflash") {
+                const bool budget_done = finish_reason == "budget" && static_cast<int>(generated.size()) == new_tokens;
+                const bool eos_done = finish_reason == "eos" && !generated.empty() && is_text_eos(generated.back());
+                if (!budget_done && !eos_done) {
+                    result.ok = false;
+                    result.reason = finish_reason.empty() ? "dflash_unfinished" : finish_reason;
+                    result.token_ids = generated;
+                    result.rank0_tokens = generated;
+                    result.rank1_tokens = child_tokens;
+                    result.committed = 0;
+                    return result;
+                }
+                result.reason = finish_reason;
+                result.draft_tokens = drafts;
+                result.accept_count = accepted;
+                if (verify_rounds == 0) result.dflash_accept = "anchor_only";
+                else if (accepted == 7 * verify_rounds) result.dflash_accept = "full_plus_bonus";
+                else if (accepted == 0) result.dflash_accept = "bonus_only";
+                else result.dflash_accept = "partial_plus_bonus";
+            }
+            publish(model, generated);
             result.rank0_tokens = generated;
-            result.rank1_tokens = child;
-            result.committed = 0;
+            result.rank1_tokens = std::move(child_tokens);
+            result.rank0_committed = rank0.committed;
+            result.rank1_committed = rank1.committed;
             return result;
+        } catch (...) {
+            session.parent_end.reset();
+            if (session.child) session.child->reap();
+            throw;
         }
-        finish(model, generated);
-        result.rank0_tokens = generated;
-        result.rank1_tokens = child;
-        result.rank0_committed = rank0.committed;
-        result.rank1_committed = rank1.committed;
-        if (mode == "dflash") {
-            result.draft_tokens = drafts;
-            result.accept_count = accepted;
-            result.dflash_accept = accepted == 7 ? "full_plus_bonus" : (accepted == 0 ? "bonus_only" : "partial_plus_bonus");
-        }
-        return result;
     }
 
     TextModel model(checkpoint, 1);
-    finish(model, greedy_tokens(model, result.prompt_tokens, new_tokens));
+    publish(model, greedy_tokens(model, result.prompt_tokens, new_tokens));
     result.rank0_tokens = result.token_ids;
     result.rank0_committed = result.committed;
     return result;

@@ -119,3 +119,5 @@ SM121 kernels for KDA, sparse MLA, the indexer, and MoE; an NCCL TP2 process
 on the CX-7 link; paged fp8 KV and KDA state; DFlash2 on the device; then
 token parity with a Blackwell server on `fixed-text-v1`. Placeholder kernels
 are not part of this record.
+
+On 2026-09-22 four host defects were fixed: in-place `causal_conv_silu` stores the raw sample rather than the SiLU output, `Store` releases a mapped shard if construction throws, the TP2/DFlash fork path closes its sockets and reaps the child (including on `_exit(1)`), and DFlash verify restores the snapshot before the committed round is stepped. `cmake --build build -j` and `ctest --test-dir build --output-on-failure` passed 11/11, including text_forward, speculative, exl3_decode, exl3_linear, and host_python_regressions. Step 0 still applies SiLU to the raw activation, and Hadamard, EXL3, MoE scale, and mHC were not changed, so this does not move the first eager argmax. The in-place history fix can change later tokens, the recorded server continuation `13041,13041` was not re-measured, and no full-model forward was run.

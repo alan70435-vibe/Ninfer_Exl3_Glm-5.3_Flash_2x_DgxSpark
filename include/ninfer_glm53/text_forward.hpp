@@ -22,7 +22,8 @@ void router_select(const float* logits, const float* bias, int experts, int top_
 void kda_forget_gate(const float* proj, const float* dt_bias, const float* a_log, float lower_bound, int heads,
                      int dim, float* g);
 
-// Depthwise causal conv. weight is [channels, kernel], mem is [channels, kernel - 1] oldest first.
+// Depthwise causal conv. weight is [channels, kernel], mem is [channels, kernel-1] oldest first.
+// Exact alias x==y is supported; partial overlap is rejected.
 void causal_conv_silu(const float* x, const float* weight, float* mem, int channels, int kernel, float* y);
 
 // One KDA step. q/k/v/g are [heads, dim], beta is [heads], state is [heads, dim, dim] and is updated.
