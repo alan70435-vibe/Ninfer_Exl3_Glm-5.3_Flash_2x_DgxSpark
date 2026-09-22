@@ -103,6 +103,10 @@ The existing host build's CTest was 11/11. That suite is not a GB10 continuation
 
 After `glm53-exl3-worker` was stopped, `ninfer-glm53-generate` ran on `gx10-23ec` (NVIDIA GB10 12.1, `GPU-d5d58447-ec10-0155-e20a-cf12158797b9`), not on the head desktop. Prompt `13041`, greedy, `new_tokens=2`, revision `25a44fdbf16862a46b7cc9921142c6c81350af2f`. Both repeats returned `token_ids=154822,154822`, `committed_length=2`, `world_size=1`. The first-token logits were `154822=20.9312` and `315=6.65862`. The recorded external continuation remains `13041,13041`. These two repeats agree with each other and do not match that continuation.
 
+## Kernel replay on the worker, measured 2026-09-22T15:38+08:00
+
+The same worker, still not the head desktop, ran a one-token replay inside `glm53-local:maintenance-20260918` (the image of the stopped `glm53-exl3-worker`). The replay called that image's tilelang mHC, causal convolution, fused recurrent KDA, and EXL3 `execute_exl3_linear`, with bf16 GEMMs for the dense projections. It did not start the vLLM server, TP=2, fp8 KV, or speculative decoding. Prompt token `13041`, revision `25a44fdbf16862a46b7cc9921142c6c81350af2f`. After layer 44 the lm_head argmax was `154822` at logit `21.0`, and the runner-up was `315` at `6.65625`. Given the eager forward's own q, k, v, and beta, the zero-state KDA core at layers 0, 1, 2, and 4 matched `beta * v * dot(q_scaled, k)` with max abs below `1e-8`. This agrees with the eager greedy logits above and does not match the recorded server continuation `13041,13041`.
+
 ## Still required on Blackwell
 
 SM121 kernels for KDA, sparse MLA, the indexer, and MoE; an NCCL TP2 process
